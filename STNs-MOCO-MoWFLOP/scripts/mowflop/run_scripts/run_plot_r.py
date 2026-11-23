@@ -1,0 +1,282 @@
+"""Desenha as STNs com o ``scripts/plot.R`` deste repositório, um arquivo por algoritmo.
+
+No modelo multiobjetivo (Ochoa, Liefooghe, Lavinas & Aranha 2023) uma STN
+mesclada mescla os grafos dos *p vetores de escalarização de um algoritmo* --
+o que ``create .R`` já fez, nos atributos ``Vector``/``Vectors``.  Mesclar
+entre algoritmos é a construção monoobjetivo do trabalho de 2021, não este.
+Então cada algoritmo ganha sua própria figura, desenhada pelo seu
+``plot_stn``.
+
+``plot.R`` não pode simplesmente ser rodado: o driver no final do arquivo
+assume seis arquivos por algoritmo e os indexa como ``c(1, 3, 5)`` /
+``c(2, 4, 6)`` (o design rho-mnk), enquanto temos um arquivo por algoritmo.
+Este script portanto reaproveita ``plot_stn`` **ao pé da letra** -- pega o
+prefixo de ``plot.R`` até o fim dessa função, reescreve só as constantes de
+pasta (como ``run_scripts/run_create_r.py`` faz), e adiciona um driver que
+itera sobre quaisquer arquivos que existam.  Confere que nada além dessas
+constantes mudou antes de rodar.
+
+Layouts, ambos de ``plot_stn``:
+
+``of``  espaço objetivo -- ``x = f1``, ``y = f2``, com a frente de referência
+        desenhada por cima.  O default sensato aqui: nenhum layout de força a
+        calcular, e a figura é diretamente legível como custo contra potência.
+        Todos os ``of`` de uma mesma instância saem nos mesmos eixos (janela
+        comum a nós + frente, via ``coord_cartesian``), para poderem ser
+        comparados lado a lado.
+``fd``  força dirigida (``graphopt``).  Opcional: é lento e vira uma bola de
+        lã com dezenas de milhares de nós.
+
+Uso::
+
+    python -m mowflop.run_scripts.run_plot_r --tag x60
+    python -m mowflop.run_scripts.run_plot_r --tag raw --layout both --pf-size 0.8 --pf-alpha 0.6
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from ..io_raw import out_root, repo_root
+
+CONSTANTS = {
+    "infolder": re.compile(r'^infolder\s*<-\s*".*?"'),
+    "outfolder": re.compile(r'^outfolder\s*<-\s*".*?"'),
+}
+NUMERIC_CONSTANTS = {
+    "pSize": re.compile(r"^pSize\s*<-\s*[0-9.]+"),
+    "pAlpha": re.compile(r"^pAlpha\s*<-\s*[0-9.]+"),
+}
+
+DRIVER = r"""
+# ---- driver added by mowflop.run_scripts.run_plot_r ------------------------
+# One picture per algorithm: the STN of an algorithm already merges its p
+# scalarisation vectors (see the Vectors attribute built by "create .R").
+
+finite_range <- function(x) { x <- x[is.finite(x)]; if (length(x)) range(x) else NULL }
+
+# Shared objective-space window per instance, so every "of" panel of the same
+# instance (its 2 algorithms x 3 configs) is drawn on identical axes and can be
+# compared side by side. Spans nodes AND the reference front, across every file
+# of the instance; coord_cartesian only clips the view, so no point is dropped.
+of_limits <- new.env()
+if ("of" %in% LAYOUTS) {
+   for (iset in isets) {
+      for (f in list.files(paste0(infolder, iset))) {
+         e <- new.env()
+         load(paste0(infolder, iset, f), envir = e)
+         inst <- strsplit(f, "_")[[1]][3]
+         xr <- finite_range(c(e$nodes$f1, e$pf$f1))
+         yr <- finite_range(c(e$nodes$f2, e$pf$f2))
+         prev <- of_limits[[inst]]
+         of_limits[[inst]] <- if (is.null(prev)) list(x = xr, y = yr) else
+            list(x = range(c(prev$x, xr)), y = range(c(prev$y, yr)))
+      }
+   }
+}
+
+draw <- function(job) {
+   f <- job$f; mode <- job$mode
+   stem <- substr(f, 1, nchar(f) - 6)   # drop ".RData"
+   out <- paste0(outfolder, stem, "_", mode, ".png")
+   # Already drawn by an earlier, interrupted run: keep it and cost nothing.
+   # A worker killed mid-ggsave leaves the file at 0 bytes, so size decides.
+   if (file.exists(out) && file.size(out) > 0) {
+      cat("=", out, "\n")
+      return(TRUE)
+   }
+   p <- plot_stn(f, job$iset, bObjLay = (mode == "of"))
+   if (mode == "of") {
+      lim <- of_limits[[strsplit(f, "_")[[1]][3]]]
+      if (!is.null(lim))
+         p <- p + coord_cartesian(xlim = lim$x, ylim = lim$y)
+   }
+   ggsave(p, filename = out, device = "png",
+          width = 9, height = 7, dpi = 150, limitsize = FALSE)
+   cat("->", out, "\n")
+   TRUE
+}
+
+# One job per (file, layout), drawn MOWFLOP_JOBS at a time (default 1 = serial).
+# Largest STNs first, handed out one by one, so the slow "fd" of a huge STN
+# does not start last and leave the other workers idle.
+jobs <- list()
+for (iset in isets) {
+   for (f in list.files(paste0(infolder, iset))) {
+      size <- file.size(paste0(infolder, iset, f))
+      for (mode in LAYOUTS)
+         jobs[[length(jobs) + 1]] <- list(f = f, iset = iset, mode = mode, size = size)
+   }
+}
+if (length(jobs) > 0) {
+   jobs <- jobs[order(-vapply(jobs, function(j) j$size, numeric(1)))]
+   ncores <- max(1L, as.integer(Sys.getenv("MOWFLOP_JOBS", "1")))
+   res <- parallel::mclapply(jobs, draw, mc.cores = ncores, mc.preschedule = FALSE)
+   # a worker killed mid-plot (e.g. out of memory) comes back as NULL, not as an error
+   failed <- vapply(res, function(r) !isTRUE(r), logical(1))
+   if (any(failed)) {
+      for (i in which(failed)) cat("FAILED", jobs[[i]]$f, jobs[[i]]$mode, ":", format(res[[i]]), "\n")
+      stop(sum(failed), " plot(s) failed")
+   }
+}
+"""
+
+
+def cut_prefix(source: str) -> tuple[list[str], int]:
+    """Linhas de ``plot.R`` até o fim (inclusive) de ``plot_stn``.
+
+    Args:
+        source: conteúdo original de ``plot.R``.
+
+    Returns:
+        Tupla ``(linhas do prefixo, índice da última linha do prefixo)``.
+
+    Raises:
+        ValueError: se ``plot_stn`` não for encontrada, ou se o fim da função
+            não puder ser localizado.
+    """
+    lines = source.splitlines(keepends=True)
+    if not any("plot_stn <- function" in line for line in lines):
+        raise ValueError("plot_stn not found in plot.R")
+    # procura o "return(p)" da função e depois o "}" de fechamento seguinte
+    for i, line in enumerate(lines):
+        if line.strip() == "return(p)":
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() == "}":
+                    return lines[: j + 1], j + 1
+    raise ValueError("could not find the end of plot_stn in plot.R")
+
+
+def rewrite(lines: list[str], folders: dict[str, str], numbers: dict[str, float]) -> tuple[str, list[int]]:
+    """Reescreve as constantes de pasta e, se dados, os parâmetros numéricos de estilo.
+
+    Args:
+        lines: linhas do prefixo de ``plot.R`` (ver :func:`cut_prefix`).
+        folders: novos valores para ``infolder`` e ``outfolder``.
+        numbers: novos valores para ``pSize``/``pAlpha``; ``None`` mantém o
+            valor original.
+
+    Returns:
+        Tupla ``(fonte reescrita, números das linhas alteradas)``.
+    """
+    changed = []
+    for i, line in enumerate(lines):
+        for name, pattern in CONSTANTS.items():
+            if pattern.match(line):
+                lines[i] = f'{name} <- "{folders[name]}"\n'
+                changed.append(i + 1)
+        for name, pattern in NUMERIC_CONSTANTS.items():
+            if numbers.get(name) is not None and pattern.match(line):
+                lines[i] = f"{name} <- {numbers[name]}\n"
+                changed.append(i + 1)
+    return "".join(lines), changed
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Ponto de entrada de linha de comando.
+
+    Args:
+        argv: argumentos de linha de comando; ``None`` usa ``sys.argv``.
+
+    Returns:
+        Código de saída do ``Rscript`` chamado, ou um código próprio se algo
+        falhar antes disso (arquivo ausente, STNs ausentes, diff inesperado,
+        ``Rscript`` não encontrado).
+    """
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--tag", required=True, help="dataset tag, e.g. x60, raw")
+    parser.add_argument("--layout", choices=["of", "fd", "both"], default="of")
+    parser.add_argument("--pf-size", type=float, help="override pSize in plot.R")
+    parser.add_argument("--pf-alpha", type=float, help="override pAlpha in plot.R")
+    parser.add_argument("--repo", default=str(repo_root()))
+    parser.add_argument(
+        "--out",
+        default=str(out_root()),
+        help="raiz de data/, pf/, stns/, plots/, metrics/ (default: $MOWFLOP_OUT, senão o repo)",
+    )
+    parser.add_argument("--rscript", default="Rscript")
+    parser.add_argument("--lib", default=str(Path.home() / "R" / "library"),
+                        help="extra R library path (ggraph lives there)")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    repo = Path(args.repo)
+    out = Path(args.out)  # o .R sai de repo/scripts/, mas roda com cwd em out
+    script = repo / "scripts" / "plot.R"
+    if not script.is_file():
+        print(f"not found: {script}", file=sys.stderr)
+        return 1
+
+    folders = {
+        "infolder": f"stns/mowflop_{args.tag}/",
+        "outfolder": f"plots/mowflop_{args.tag}/",
+    }
+    if not (out / folders["infolder"]).is_dir():
+        print(f"missing STNs: {out / folders['infolder']}", file=sys.stderr)
+        return 1
+    (out / folders["outfolder"]).mkdir(parents=True, exist_ok=True)
+
+    source = script.read_text(encoding="utf-8")
+    prefix, cut = cut_prefix(source)
+    original_prefix = "".join(prefix)
+    rewritten, changed = rewrite(
+        list(prefix), folders, {"pSize": args.pf_size, "pAlpha": args.pf_alpha}
+    )
+
+    # diff de segurança: só as constantes reescritas podem diferir do prefixo original
+    diff = [
+        line
+        for line in difflib.unified_diff(
+            original_prefix.splitlines(), rewritten.splitlines(), lineterm="", n=0
+        )
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    ]
+    print(f"plot.R: reaproveitando as linhas 1-{cut} (até o fim de plot_stn) sem alteração,")
+    print(f"        exceto as constantes nas linhas {changed}:")
+    for line in diff:
+        print(f"  {line}")
+    # diff vazio é ok: acontece quando o valor reescrito já era igual ao
+    # anterior (ex.: plot.R já apontava pra essa mesma tag) -- só um diff de
+    # tamanho *diferente* de 0 ou 2*len(changed) indica que outra coisa mudou
+    if len(diff) not in (0, 2 * len(changed)):
+        print("refusing to run: something other than the constants changed", file=sys.stderr)
+        return 1
+
+    layouts = ["of", "fd"] if args.layout == "both" else [args.layout]
+    header = (
+        f'.libPaths(c("{args.lib}", .libPaths()))\n'
+        if Path(args.lib).is_dir()
+        else ""
+    )
+    names = ", ".join(f'"{mode}"' for mode in layouts)
+    body = header + rewritten + f"\nLAYOUTS <- c({names})\n" + DRIVER
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".R", dir=str(repo / "scripts"), delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(body)
+        temporary = Path(handle.name)
+
+    if args.dry_run:
+        temporary.unlink(missing_ok=True)
+        print("dry run; R não foi chamado")
+        return 0
+
+    try:
+        completed = subprocess.run([args.rscript, str(temporary)], cwd=str(out), check=False)
+    except FileNotFoundError:
+        print(f"{args.rscript} não encontrado", file=sys.stderr)
+        return 127
+    finally:
+        temporary.unlink(missing_ok=True)
+    return completed.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
